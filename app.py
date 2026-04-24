@@ -9,7 +9,7 @@ from sklearn.ensemble import RandomForestClassifier
 # ==========================================
 # 0. UI 样式配置
 # ==========================================
-st.set_page_config(page_title="Sniper AI V29.5", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Sniper AI V30.0", page_icon="🎯", layout="wide")
 
 st.markdown("""
 <style>
@@ -24,7 +24,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. 核心类：SniperFetcher (完全整合你的解析逻辑)
+# 1. 核心类：SniperFetcher (API 数据抓取)
 # ==========================================
 class SniperFetcher:
     def __init__(self, api_key):
@@ -35,7 +35,6 @@ class SniperFetcher:
         }
 
     def get_matches(self, category_id, target_tournament_id, date_str):
-        """完全参照你提供的扫描逻辑"""
         endpoint = f"{self.base_url}/tournaments/get-scheduled-events"
         params = {"categoryId": str(category_id), "date": date_str}
         try:
@@ -57,10 +56,6 @@ class SniperFetcher:
         except: return pd.DataFrame()
 
     def get_real_odds(self, match_id):
-        """
-        🚀 直接搬运你代码中的“究极解析逻辑”
-        确保处理多级嵌套、分数赔率转换等所有边缘情况
-        """
         url = f"{self.base_url}/matches/get-all-odds"
         try:
             res = requests.get(url, headers=self.headers, params={"matchId": match_id}, timeout=12)
@@ -73,7 +68,6 @@ class SniperFetcher:
                 m_name = str(m.get('marketName', '')).lower()
                 f_name = str(m.get('filterName', '')).lower()
                 
-                # 寻找 1X2 市场
                 is_1x2 = any(k in m_name or k in f_name for k in ["1x2", "3-way", "result", "full time", "winner"])
                 is_not_half = all(k not in m_name and k not in f_name for k in ["half", "quarter"])
 
@@ -84,7 +78,6 @@ class SniperFetcher:
                         for c in choices:
                             name = str(c.get('name', '')).upper()
                             val = c.get('decimalValue')
-                            # 关键：分数赔率转换逻辑 (n/d + 1)
                             if not val and c.get('fractionalValue') and '/' in str(c.get('fractionalValue')):
                                 n, d = str(c.get('fractionalValue')).split('/')
                                 val = (float(n) / float(d)) + 1.0
@@ -100,37 +93,51 @@ class SniperFetcher:
         except: return None
 
 # ==========================================
-# 2. 自动化模型训练 (基于 B365 隐含概率)
+# 2. 多模型训练引擎 (Multi-Model Architecture)
 # ==========================================
 @st.cache_resource
-def train_sniper_model():
-    data_files = ['SP12324.csv', 'ESP12425.csv', 'SP1.csv', 'E0_2324.CSV', 'E0_2425.CSV', 'E0_2526.CSV']
-    all_data = []
-    for f in data_files:
-        if os.path.exists(f):
-            try:
-                tmp = pd.read_csv(f)
-                tmp.columns = [c.upper() for c in tmp.columns]
-                all_data.append(tmp)
-            except: pass
-    if not all_data: return None
-    df = pd.concat(all_data, ignore_index=True).dropna(subset=['B365H', 'B365D', 'B365A', 'FTR'])
-    # 特征工程：隐含概率
-    X = pd.DataFrame({'PH': 1/df['B365H'], 'PD': 1/df['B365D'], 'PA': 1/df['B365A']})
-    y = df['FTR'].map({'H': 0, 'D': 1, 'A': 2})
-    model = RandomForestClassifier(n_estimators=300, max_depth=8, random_state=42)
-    model.fit(X, y)
-    return model
+def train_league_models():
+    """独立拆分训练，返回一个模型字典"""
+    file_map = {
+        "E0": ['E0_2324.csv', 'E0_2425.csv', 'E0_2526.csv'],
+        "SP1": ['SP1_2324.csv', 'SP1_2425.csv', 'SP1_2526.csv']
+    }
+    
+    models = {}
+    
+    for league_code, files in file_map.items():
+        all_data = []
+        for f in files:
+            if os.path.exists(f):
+                try:
+                    tmp = pd.read_csv(f)
+                    tmp.columns = [c.upper() for c in tmp.columns]
+                    all_data.append(tmp)
+                except: pass
+                
+        if all_data:
+            df = pd.concat(all_data, ignore_index=True).dropna(subset=['B365H', 'B365D', 'B365A', 'FTR'])
+            X = pd.DataFrame({'PH': 1/df['B365H'], 'PD': 1/df['B365D'], 'PA': 1/df['B365A']})
+            y = df['FTR'].map({'H': 0, 'D': 1, 'A': 2})
+            
+            # 为每个联赛单独拟合模型
+            model = RandomForestClassifier(n_estimators=300, max_depth=8, random_state=42)
+            model.fit(X, y)
+            models[league_code] = model
+            
+    return models
 
 # ==========================================
-# 3. 主界面逻辑
+# 3. 主界面与动态模型路由
 # ==========================================
 def main():
-    st.title("🎯 Sniper AI 预测终端 (V29.5)")
+    st.title("🎯 Sniper AI 预测终端 (V30.0)")
     
     DEFAULT_KEY = "1c77b88820mshbd12fc151d1a3b1p161770jsn1e5a287b9915"
     fetcher = SniperFetcher(DEFAULT_KEY)
-    model = train_sniper_model()
+    
+    # 获取多模型字典
+    models = train_league_models()
 
     if "match_list" not in st.session_state: st.session_state.match_list = pd.DataFrame()
 
@@ -139,12 +146,23 @@ def main():
     league_choice = st.sidebar.selectbox("选择联赛", ["英超 (Premier League)", "西甲 (La Liga)"])
     date_input = st.sidebar.date_input("分析日期", datetime.now())
     
-    league_map = {"英超 (Premier League)": (1, 17), "西甲 (La Liga)": (32, 8)}
+    # 建立映射字典：包含 API 抓取所需的 ID，以及路由所需的专属模型代码 (code)
+    league_map = {
+        "英超 (Premier League)": {"cat": 1, "tour": 17, "code": "E0"},
+        "西甲 (La Liga)": {"cat": 32, "tour": 8, "code": "SP1"}
+    }
     
+    active_league_info = league_map[league_choice]
+    
+    # 状态指示器，显示当前加载的模型状态
+    if active_league_info["code"] in models:
+        st.sidebar.success(f"🧠 {active_league_info['code']} 专属 AI 模型已就绪")
+    else:
+        st.sidebar.error(f"⚠️ 缺少 {active_league_info['code']} 历史数据文件，模型未加载")
+
     if st.sidebar.button("🔍 扫描赛事"):
-        cat_id, tour_id = league_map[league_choice]
         with st.spinner("正在同步赛程..."):
-            df = fetcher.get_matches(cat_id, tour_id, date_input.strftime('%Y-%m-%d'))
+            df = fetcher.get_matches(active_league_info["cat"], active_league_info["tour"], date_input.strftime('%Y-%m-%d'))
             if not df.empty:
                 df.insert(0, "分析", False)
                 st.session_state.match_list = df
@@ -165,18 +183,24 @@ def main():
         if not selected.empty:
             if st.button(f"🚀 执行量化深度分析 ({len(selected)} 场)", type="primary"):
                 st.divider()
-                for _, row in selected.iterrows():
-                    render_report(row, fetcher, model)
+                # 提取用户当前选中联赛的专属模型
+                target_model = models.get(active_league_info["code"])
+                
+                if target_model:
+                    for _, row in selected.iterrows():
+                        render_report(row, fetcher, target_model)
+                else:
+                    st.error(f"无法执行分析：未找到 {active_league_info['code']} 的训练模型，请确认数据文件存在。")
 
 def render_report(row, fetcher, model):
     with st.spinner(f"正在深度解析 {row['home_team']}..."):
         odds = fetcher.get_real_odds(row['match_id'])
         
         if not odds:
-            st.error(f"❌ {row['home_team']} vs {row['away_team']}: 赔率解析失败 (API 未返回有效 1X2 市场)")
+            st.error(f"❌ {row['home_team']} vs {row['away_team']}: 赔率解析失败 (API 未返回有效市场)")
             return
 
-        # AI 推理
+        # AI 推理：使用传入的联赛专属模型
         feat = pd.DataFrame([[1/odds['home'], 1/odds['draw'], 1/odds['away']]], columns=['PH', 'PD', 'PA'])
         probs = model.predict_proba(feat)[0]
         hp, dp, ap = probs[0], probs[1], probs[2]
