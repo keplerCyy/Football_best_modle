@@ -2,6 +2,8 @@ import pandas as pd
 import numpy as np
 import os
 from sklearn.ensemble import RandomForestClassifier
+import warnings
+warnings.filterwarnings('ignore')
 
 # ==========================================
 # 1. 核心基本面与市场特征引擎
@@ -45,11 +47,9 @@ def add_xg_efficiency_engine(df):
     return df
 
 def add_market_probabilities(df):
-    """
-    提取庄家对胜平负的隐含概率作为最强先验特征
-    """
     df = df.copy()
-    odds_h = 'B365H' if 'B365H' in df.columns else 'BbAvAHH'
+    # 优先使用 B365 赔率，若无则使用平均赔率
+    odds_h = 'B365H' if 'B365H' in df.columns else 'BbAvH'
     odds_d = 'B365D' if 'B365D' in df.columns else 'BbAvD'
     odds_a = 'B365A' if 'B365A' in df.columns else 'BbAvA'
     
@@ -59,17 +59,43 @@ def add_market_probabilities(df):
         df['Prob_D_Bookie'] = (1/df[odds_d]) / df['Market_Margin']
         df['Prob_A_Bookie'] = (1/df[odds_a]) / df['Market_Margin']
     else:
-        df['Prob_H_Bookie'] = 0.33
-        df['Prob_D_Bookie'] = 0.33
-        df['Prob_A_Bookie'] = 0.33
+        df['Prob_H_Bookie'], df['Prob_D_Bookie'], df['Prob_A_Bookie'] = 0.33, 0.33, 0.33
     return df
 
 # ==========================================
-# 2. 滚动回测主流程 (三分类预测)
+# 2. Sniper V40.0 置信度引擎
 # ==========================================
 
-def run_v28_pure_prediction_workflow(file_list):
-    print(f"--- Sniper V28.0: 英超 (E0) 全域胜平负预测引擎 ---")
+def calculate_confidence_score(row):
+    """
+    多维置信度算法：融合绝对概率、优势差与熵隙
+    """
+    model_prob = row['pred_prob']
+    pred_class = row['pred_class']
+    
+    # 1. 计算优势差 (Edge): 模型概率与庄家隐含概率的差值
+    market_prob = row[f'Prob_{pred_class}_Bookie']
+    edge = model_prob - market_prob
+    
+    # 2. 计算熵隙 (Entropy Gap): 第一预测与第二预测的概率差
+    all_probs = sorted([row['model_prob_H'], row['model_prob_D'], row['model_prob_A']], reverse=True)
+    prob_gap = all_probs[0] - all_probs[1]
+    
+    # 3. 综合加权评分 (Standardized 0-100)
+    # 权重: 绝对概率(30%) + 优势差(50%) + 熵隙(20%)
+    # Edge 是核心，代表了“超额获胜的可能性”
+    edge_norm = np.clip((edge + 0.1) / 0.3, 0, 1) # 将 -0.1~0.2 映射到 0~1
+    gap_norm = np.clip(prob_gap / 0.4, 0, 1)
+    
+    score = (model_prob * 0.3 + edge_norm * 0.5 + gap_norm * 0.2) * 100
+    return round(score, 2)
+
+# ==========================================
+# 3. 滚动回测与评估流程
+# ==========================================
+
+def run_v40_confidence_workflow(file_list):
+    print(f"--- Sniper V40.0: 多维置信度量化引擎 ---")
     
     all_df = []
     for f in file_list:
@@ -85,12 +111,13 @@ def run_v28_pure_prediction_workflow(file_list):
     df = pd.concat(all_df).sort_values('Date').reset_index(drop=True).copy()
     df = df.dropna(subset=['HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR'])
 
+    # 特征生成
     df['Elo_Diff'] = calculate_elo_engine(df)
     df = add_momentum_engine(df)
     df = add_xg_efficiency_engine(df)
     df = add_market_probabilities(df)
     
-    # 目标变量映射为数字：Away=0, Draw=1, Home=2
+    # 目标变量映射
     label_map = {'A': 0, 'D': 1, 'H': 2}
     reverse_map = {0: 'A', 1: 'D', 2: 'H'}
     df['target'] = df['FTR'].map(label_map)
@@ -98,73 +125,74 @@ def run_v28_pure_prediction_workflow(file_list):
     features = ['Elo_Diff', 'Form_Diff', 'xG_Diff', 'Prob_H_Bookie', 'Prob_D_Bookie', 'Prob_A_Bookie']
     df = df.dropna(subset=features + ['target']).reset_index(drop=True)
 
-    train_size, step, predictions = 250, 20, []
+    train_size, step, predictions = 300, 25, []
+    
+    print(f"开始滚动回测: 总样本 {len(df)} 场...")
     
     for start in range(train_size, len(df), step):
         end = min(start + step, len(df))
         
-        # 使用原生 RandomForest 进行多分类预测
-        model = RandomForestClassifier(n_estimators=1000, max_depth=6, random_state=42)
+        # 训练模型
+        model = RandomForestClassifier(n_estimators=1000, max_depth=6, random_state=42, n_jobs=-1)
         model.fit(df.iloc[:start][features], df.iloc[:start]['target'])
         
         chunk = df.iloc[start:end].copy()
-        # 获取 [A, D, H] 的概率数组
         probs = model.predict_proba(chunk[features])
         
-        # 记录模型最高置信度的选项及概率
-        chunk['pred_class_num'] = np.argmax(probs, axis=1)
-        chunk['pred_class'] = chunk['pred_class_num'].map(reverse_map)
-        chunk['pred_prob'] = np.max(probs, axis=1)
-        
-        # 记录具体每项的概率
+        # 记录每种预测的概率
         chunk['model_prob_A'] = probs[:, 0]
         chunk['model_prob_D'] = probs[:, 1]
         chunk['model_prob_H'] = probs[:, 2]
         
+        # 核心预测结果
+        chunk['pred_class_num'] = np.argmax(probs, axis=1)
+        chunk['pred_class'] = chunk['pred_class_num'].map(reverse_map)
+        chunk['pred_prob'] = np.max(probs, axis=1)
+        
+        # 计算置信度评分
+        chunk['confidence_score'] = chunk.apply(calculate_confidence_score, axis=1)
         predictions.append(chunk)
 
     final_df = pd.concat(predictions)
-    
-    # 触发条件：为了覆盖足够多的场次，我们只设置一个极低的置信度过滤
-    # （例如预测概率大于 0.40 即可触发，平局由于概率天然低，可降低要求）
-    def is_trigger(row):
-        prob = row['pred_prob']
-        pred = row['pred_class']
-        if pred == 'D':
-            return prob > 0.28  # 平局的概率极少超过35%，降低门槛以覆盖平局
-        else:
-            return prob > 0.45  # 胜负稍微要求一点置信度
-            
-    final_df['is_trigger'] = final_df.apply(is_trigger, axis=1)
-    hits = final_df[final_df['is_trigger']].copy()
-    
-    hits['is_correct'] = (hits['pred_class'] == hits['FTR']).astype(int)
+    final_df['is_correct'] = (final_df['pred_class'] == final_df['FTR']).astype(int)
 
-    print("\n" + "="*50)
-    print(f"   V28.0 核心指标 (忽略 ROI，专注预测准确率)")
-    print("="*50)
+    # ==========================================
+    # 4. 结果分级展示 (PM 报告风格)
+    # ==========================================
+    print("\n" + "="*60)
+    print(f"   Sniper V40.0 核心回测报告 (基于置信度分级)")
+    print("="*60)
     
-    if not hits.empty:
-        wr = hits['is_correct'].mean()
-        
-        print(f"总回测场次: {len(final_df)} 场")
-        print(f"实际触发场次: {len(hits)} 场 (占比 {len(hits)/len(final_df):.2%})")
-        print(f"全局预测准确率: {wr:.2%}")
-        
-        print("\n--- 细分赛果覆盖与准确率 ---")
-        for outcome in ['H', 'D', 'A']:
-            subset = hits[hits['pred_class'] == outcome]
-            if not subset.empty:
-                acc = subset['is_correct'].mean()
-                print(f"预测 [{outcome}] 触发: {len(subset)} 场 | 准确率: {acc:.2%}")
-            else:
-                print(f"预测 [{outcome}] 触发: 0 场")
-                
-        recent_hits = hits.tail(100)
-        print(f"\n最近 100 场触发命中数: {recent_hits['is_correct'].sum()} / {len(recent_hits)}")
-    else:
-        print("未触发信号。")
+    # 定义评级
+    bins = [0, 50, 70, 85, 100]
+    labels = ['C级 (噪音)', 'B级 (观察)', 'A级 (稳健)', 'S级 (核心)']
+    final_df['Grade'] = pd.cut(final_df['confidence_score'], bins=bins, labels=labels)
+
+    summary = final_df.groupby('Grade').agg({
+        'is_correct': ['count', 'mean']
+    }).reset_index()
+    
+    summary.columns = ['评级', '场次数', '准确率']
+    
+    for _, row in summary.iterrows():
+        print(f"{row['评级']}: 场次={int(row['场次数']):<4} | 准确率={row['准确率']:.2%}")
+
+    print("-" * 60)
+    
+    # 针对高置信度场次的细分
+    s_hits = final_df[final_df['Grade'].isin(['S级 (核心)', 'A级 (稳健)'])]
+    if not s_hits.empty:
+        print(f"【高置信度触发】(Score > 70)")
+        print(f"总触发场次: {len(s_hits)} | 综合胜率: {s_hits['is_correct'].mean():.2%}")
+        for res in ['H', 'D', 'A']:
+            res_df = s_hits[s_hits['pred_class'] == res]
+            if not res_df.empty:
+                print(f"  - 预测 {res} 胜率: {res_df['is_correct'].mean():.2%}")
+
+    print("\n[最新 5 场高置信度信号预测]")
+    print(final_df[final_df['confidence_score'] > 65][['Date', 'HomeTeam', 'AwayTeam', 'pred_class', 'confidence_score', 'FTR']].tail(5))
 
 if __name__ == "__main__":
-    data_files = ['SP12324.csv', 'ESP12425.csv', 'SP1.csv','E0_2324.CSV','E0_2425.CSV','E0_2526.CSV']
-    run_v28_pure_prediction_workflow(data_files)
+    # 请确保这些文件在同一目录下
+    data_files = ['SP1_2324.csv', 'SP1_2425.csv', 'SP1_2526.csv','E0_2324.CSV','E0_2425.CSV','E0_2526.CSV','F1_2324.CSV','F1_2425.CSV','F1_2526.CSV']
+    run_v40_confidence_workflow(data_files)
