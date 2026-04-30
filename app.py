@@ -5,11 +5,12 @@ import os
 import numpy as np
 from datetime import datetime
 from sklearn.ensemble import RandomForestClassifier
+from scipy.stats import poisson
 
 # ==========================================
 # 0. UI 样式配置
 # ==========================================
-st.set_page_config(page_title="Sniper AI V30.0", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Sniper AI V30.0 (Fusion)", page_icon="🎯", layout="wide")
 
 st.markdown("""
 <style>
@@ -20,6 +21,7 @@ st.markdown("""
     }
     .metric-val { font-size: 1.5em; font-weight: 800; color: #222; }
     .status-tag { padding: 3px 12px; border-radius: 15px; font-weight: bold; font-size: 0.9em; }
+    .ou-tag { padding: 3px 8px; border-radius: 5px; font-size: 0.85em; margin-left: 10px; color: white; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -30,7 +32,7 @@ class SniperFetcher:
     def __init__(self, api_key):
         self.base_url = "https://sofascore.p.rapidapi.com"
         self.headers = {
-            "X-RapidAPI-Key": api_key,
+            "X-RapidAPI-Key": "1c77b88820mshbd12fc151d1a3b1p161770jsn1e5a287b9915",
             "X-RapidAPI-Host": "sofascore.p.rapidapi.com",
         }
 
@@ -100,11 +102,11 @@ def train_league_models():
     """独立拆分训练，返回一个模型字典"""
     file_map = {
         "E0": ['E0_2324.csv', 'E0_2425.csv', 'E0_2526.csv'],
-        "SP1": ['SP1_2324.csv', 'SP1_2425.csv', 'SP1_2526.csv']
+        "SP1": ['SP1_2324.csv', 'SP1_2425.csv', 'SP1_2526.csv'],
+        "F1": ['F1_2324.CSV', 'F1_2425.CSV', 'F1_2526.CSV']  # [新增] 法甲数据
     }
     
     models = {}
-    
     for league_code, files in file_map.items():
         all_data = []
         for f in files:
@@ -120,43 +122,80 @@ def train_league_models():
             X = pd.DataFrame({'PH': 1/df['B365H'], 'PD': 1/df['B365D'], 'PA': 1/df['B365A']})
             y = df['FTR'].map({'H': 0, 'D': 1, 'A': 2})
             
-            # 为每个联赛单独拟合模型
             model = RandomForestClassifier(n_estimators=300, max_depth=8, random_state=42)
             model.fit(X, y)
             models[league_code] = model
             
     return models
 
+@st.cache_resource
+def load_poisson_stats():
+    """为泊松引擎提取历史进球分布数据"""
+    file_map = {
+        "E0": ['E0_2324.csv', 'E0_2425.csv', 'E0_2526.csv'],
+        "SP1": ['SP1_2324.csv', 'SP1_2425.csv', 'SP1_2526.csv'],
+        "F1": ['F1_2324.CSV', 'F1_2425.CSV', 'F1_2526.CSV']  # [新增] 法甲泊松数据池
+    }
+    stats = {}
+    for league_code, files in file_map.items():
+        all_data = []
+        for f in files:
+            if os.path.exists(f):
+                try:
+                    tmp = pd.read_csv(f)
+                    tmp.columns = [c.upper() for c in tmp.columns]
+                    all_data.append(tmp)
+                except: pass
+        
+        if all_data:
+            df = pd.concat(all_data, ignore_index=True)
+            if 'FTHG' in df.columns and 'FTAG' in df.columns:
+                l_avg = df['FTHG'].mean() + df['FTAG'].mean()
+                team_stats = {}
+                teams = set(df['HOMETEAM'].dropna().unique()).union(set(df['AWAYTEAM'].dropna().unique()))
+                for t in teams:
+                    h_df = df[df['HOMETEAM'] == t]
+                    a_df = df[df['AWAYTEAM'] == t]
+                    team_stats[str(t).upper()] = {
+                        'h_attack': h_df['FTHG'].tail(10).mean() if len(h_df) > 0 else 1.5,
+                        'h_defend': h_df['FTAG'].tail(10).mean() if len(h_df) > 0 else 1.5,
+                        'a_attack': a_df['FTAG'].tail(10).mean() if len(a_df) > 0 else 1.5,
+                        'a_defend': a_df['FTHG'].tail(10).mean() if len(a_df) > 0 else 1.5,
+                    }
+                stats[league_code] = {'l_avg': l_avg, 'teams': team_stats}
+    return stats
+
 # ==========================================
 # 3. 主界面与动态模型路由
 # ==========================================
 def main():
-    st.title("🎯 Sniper AI 预测终端 (V30.0)")
+    st.title("🎯 Sniper AI 预测终端 (V30.0 + V42 联动核心)")
     
     DEFAULT_KEY = "1c77b88820mshbd12fc151d1a3b1p161770jsn1e5a287b9915"
     fetcher = SniperFetcher(DEFAULT_KEY)
     
-    # 获取多模型字典
     models = train_league_models()
+    poisson_stats = load_poisson_stats()
 
     if "match_list" not in st.session_state: st.session_state.match_list = pd.DataFrame()
 
     # --- 侧边栏 ---
     st.sidebar.header("🕹️ 控制台")
-    league_choice = st.sidebar.selectbox("选择联赛", ["英超 (Premier League)", "西甲 (La Liga)"])
+    # [新增] 下拉菜单增加法甲
+    league_choice = st.sidebar.selectbox("选择联赛", ["英超 (Premier League)", "西甲 (La Liga)", "法甲 (Ligue 1)"])
     date_input = st.sidebar.date_input("分析日期", datetime.now())
     
-    # 建立映射字典：包含 API 抓取所需的 ID，以及路由所需的专属模型代码 (code)
+    # [新增] 路由字典加入 F1 配置
     league_map = {
         "英超 (Premier League)": {"cat": 1, "tour": 17, "code": "E0"},
-        "西甲 (La Liga)": {"cat": 32, "tour": 8, "code": "SP1"}
+        "西甲 (La Liga)": {"cat": 32, "tour": 8, "code": "SP1"},
+        "法甲 (Ligue 1)": {"cat": 7, "tour": 34, "code": "F1"} 
     }
     
     active_league_info = league_map[league_choice]
     
-    # 状态指示器，显示当前加载的模型状态
     if active_league_info["code"] in models:
-        st.sidebar.success(f"🧠 {active_league_info['code']} 专属 AI 模型已就绪")
+        st.sidebar.success(f"🧠 {active_league_info['code']} 专属 AI 模型与泊松引擎已就绪")
     else:
         st.sidebar.error(f"⚠️ 缺少 {active_league_info['code']} 历史数据文件，模型未加载")
 
@@ -183,16 +222,16 @@ def main():
         if not selected.empty:
             if st.button(f"🚀 执行量化深度分析 ({len(selected)} 场)", type="primary"):
                 st.divider()
-                # 提取用户当前选中联赛的专属模型
                 target_model = models.get(active_league_info["code"])
+                target_stats = poisson_stats.get(active_league_info["code"])
                 
                 if target_model:
                     for _, row in selected.iterrows():
-                        render_report(row, fetcher, target_model)
+                        render_report(row, fetcher, target_model, target_stats)
                 else:
                     st.error(f"无法执行分析：未找到 {active_league_info['code']} 的训练模型，请确认数据文件存在。")
 
-def render_report(row, fetcher, model):
+def render_report(row, fetcher, model, league_stats):
     with st.spinner(f"正在深度解析 {row['home_team']}..."):
         odds = fetcher.get_real_odds(row['match_id'])
         
@@ -200,22 +239,47 @@ def render_report(row, fetcher, model):
             st.error(f"❌ {row['home_team']} vs {row['away_team']}: 赔率解析失败 (API 未返回有效市场)")
             return
 
-        # AI 推理：使用传入的联赛专属模型
+        # 核心 1：AI 推理 1X2 模型
         feat = pd.DataFrame([[1/odds['home'], 1/odds['draw'], 1/odds['away']]], columns=['PH', 'PD', 'PA'])
         probs = model.predict_proba(feat)[0]
         hp, dp, ap = probs[0], probs[1], probs[2]
 
-        # 标签逻辑
         if hp > 0.58: label, color, icon = "主场稳胆", "#28a745", "🟢"
         elif ap > 0.48: label, color, icon = "降维打击", "#007bff", "🔵"
         else: label, color, icon = "均衡博弈", "#ffc107", "🟡"
 
-        # 渲染卡片
+        # 核心 2：引入泊松算大球概率并应用 V42 联动逻辑
+        ou_badge = ""
+        if league_stats and 'teams' in league_stats:
+            h_name = str(row['home_team']).upper()
+            a_name = str(row['away_team']).upper()
+            teams_data = league_stats['teams']
+            l_avg = league_stats['l_avg']
+            
+            h_attack = teams_data.get(h_name, {}).get('h_attack', l_avg/2)
+            h_defend = teams_data.get(h_name, {}).get('h_defend', l_avg/2)
+            a_attack = teams_data.get(a_name, {}).get('a_attack', l_avg/2)
+            a_defend = teams_data.get(a_name, {}).get('a_defend', l_avg/2)
+
+            lambda_h = (h_attack * a_defend) / (l_avg / 2)
+            lambda_a = (a_attack * h_defend) / (l_avg / 2)
+            p_over = 1 - sum([poisson.pmf(k, lambda_h + lambda_a) for k in range(3)])
+
+            if (p_over > 0.60) and (dp < 0.25):
+                ou_badge = "<span class='ou-tag' style='background:#dc3545;'>🔥 联动大球 (O2.5)</span>"
+            elif ((1 - p_over) > 0.60) and (dp > 0.35):
+                ou_badge = "<span class='ou-tag' style='background:#17a2b8;'>🧊 联动小球 (U2.5)</span>"
+            else:
+                ou_badge = f"<span class='ou-tag' style='background:#6c757d;'>⚖️ 大小球中立 ({p_over:.1%})</span>"
+
         st.markdown(f"""
         <div class="prediction-card" style="border-left-color: {color};">
             <div style="display: flex; justify-content: space-between;">
                 <span style="color:#666;">{row['kickoff']} | {row['status']}</span>
-                <span class="status-tag" style="background:{color}22; color:{color};">{icon} {label}</span>
+                <div>
+                    <span class="status-tag" style="background:{color}22; color:{color};">{icon} {label}</span>
+                    {ou_badge}
+                </div>
             </div>
             <h3 style="text-align:center; margin:15px 0;">{row['home_team']} <small>vs</small> {row['away_team']}</h3>
             <div style="display: flex; justify-content: space-around; background:#f9f9f9; padding:15px; border-radius:8px;">
